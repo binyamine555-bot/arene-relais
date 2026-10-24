@@ -1,0 +1,13 @@
+name: garde-eveil
+# Secours : reveille le relais toutes les 10 min (si le service s'est endormi).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS -m 60 --retry 3 "${RELAIS_URL}/" || true
+        env:
+          RELAIS_URL: ${{ vars.RELAIS_URL || 'https://arene-relais.onrender.com' }}
