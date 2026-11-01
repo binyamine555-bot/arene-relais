@@ -38,6 +38,8 @@ Protocole (une ligne JSON par message, terminee par "\n", 64 Ko max)
   join   {"code","pv","pm","n"} -> matched | join_ko {"why":"inconnu"|"soi"|"version"}
   matched {"pid","n","pk","host":1|0}  (envoye aux deux joueurs)
   cancel -> cancel_ok ; ping -> pong ; stats -> stats_ok
+  jscore / jtop (7o) : classement du Combat du jour, sans identification
+                 (voir la classe ClassementJour plus bas)
   pair {"pid"} : (jeu -> relais) rappel de l'adversaire apres une reconnexion
   gone {"pid"} / back {"pid"} : l'adversaire de la partie en cours vient de
                  perdre / retrouver sa connexion au relais (v15.1, ignore par
@@ -337,7 +339,8 @@ _dumps = json.JSONEncoder(separators=(',', ':')).encode
 # ------------------------------------------------------------
 class Client(object):
     __slots__ = ('tr', 'ws', 'ip', 'pid', 'pk', 'name', 'njs', 'alive', 'last',
-                 'tokens', 'token_t', 'refus', 'refus_t', 'defi', 'cid', 't0', 'buf')
+                 'tokens', 'token_t', 'refus', 'refus_t', 'defi', 'cid', 't0', 'buf',
+                 'jscore_fait')   # 7o : un envoi de score du jour par connexion
 
     def __init__(self, tr, ip, cid, ws=False):
         self.tr = tr
@@ -357,6 +360,7 @@ class Client(object):
         self.refus_t = self.last
         self.defi = secrets.token_hex(16)
         self.buf = bytearray()
+        self.jscore_fait = False
 
     def set_nom(self, n):
         self.name = n
@@ -631,6 +635,333 @@ class ProtoWS(asyncio.Protocol):
 # ------------------------------------------------------------
 # Le relais
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# 7o : classement en ligne du « Combat du jour »
+# ------------------------------------------------------------
+# Le Combat du jour est le meme pour tous (graine = la date du telephone). Le jeu envoie, apres une
+# victoire, son meilleur resultat du jour ; le relais garde UNE ligne par joueur et par date (la
+# meilleure) et renvoie le top 50 + la place du joueur. Ces deux messages marchent SANS s'identifier
+# (pas de 'auth' : on ne coupe pas la connexion en ligne du joueur et on ne lui prend pas son
+# courrier). L'envoi d'un score est SIGNE avec la cle du joueur (Ed25519) sur le defi de la
+# connexion : personne ne peut ecrire a la place d'un autre, ni rejouer un vieux message.
+#
+#   jeu -> relais  {"t":"jscore","d":"AAAA-MM-JJ","v":vies,"vm":vies_depart,"f":images,"s":score,
+#                   "n":pseudo,"ver":"16.3.0","pid":..,"pk":<b64>,"sig":<b64>}
+#                  sig = Ed25519( "jour|<defi>|<d>|<v>|<vm>|<f>|<n>|<ver>" )
+#   relais -> jeu  {"t":"jscore_ok","d","s","n","rang","total","mieux":1|0}
+#                  ou {"t":"jscore_ko","why":"date"|"valeurs"|"score"|"sig"|"debit"|"un_seul"|"plein"}
+#   jeu -> relais  {"t":"jtop","d":"AAAA-MM-JJ","pid":<facultatif>}
+#   relais -> jeu  {"t":"jtop_ok","d","total","top":[[pseudo,score,vies,images],...50],
+#                   "moi":{"rang","s","n","v","f"} ou null}
+#                  ou {"t":"jtop_ko","why":"date"|"debit"}
+# Le relais annonce cette fonction dans "hello" : "features":["jour"] (un jeu qui ne la voit pas
+# sait que ce relais n'a pas le classement et garde son record local).
+#
+# Score (le meme calcul dans le jeu, scripts/net/classement_jour.gd) :
+#     score = 1000 x vies_restantes + max(0, 999 - images // 12)        (60 images = 1 s)
+# Les vies passent avant le temps (comme le record local), puis le plus rapide gagne.
+# Anti-triche minimal : 1 <= vies <= vies_depart <= 3 ; images >= 300 x vies_depart (5 s par vie
+# de l'adversaire) et <= 30 min ; le score envoye doit etre egal au calcul ; plafond SCORE_MAX.
+# Donnees gardees : pseudo, score, vies, images, version du jeu, instant d'envoi, et l'identifiant
+# anonyme du joueur (24 hex = sha256 de sa cle publique) pour garder une seule ligne. Aucune IP
+# n'est ecrite (elle sert seulement, en memoire, a limiter le debit). Purge apres --classement-jours.
+
+CJ_TOP = 50
+CJ_FPS = 60
+CJ_VIES_MAX = 3
+CJ_IMAGES_MIN_PAR_VIE = 300          # 5 s par vie de depart
+CJ_IMAGES_MAX = 30 * 60 * CJ_FPS     # 30 min
+CJ_PAS_BONUS = 12                    # 1 point de bonus temps = 12 images (0,2 s)
+CJ_BONUS_MAX = 999
+CJ_SCORE_MAX = CJ_VIES_MAX * 1000 + CJ_BONUS_MAX - (CJ_IMAGES_MIN_PAR_VIE * CJ_VIES_MAX) // CJ_PAS_BONUS
+CJ_PSEUDO_MAX = 16
+CJ_IP_SCORES_10MIN = 20              # envois de score par IP en 10 min
+CJ_IP_LECTURES_10MIN = 60            # lectures par IP en 10 min
+CJ_PID_SCORES_JOUR = 40              # envois par joueur et par date
+CJ_LIGNES_MAX = 50000                # joueurs gardes par date (au-dela : nouveaux refuses, 'plein')
+CJ_ENVOIS_MINUTE = 1200              # envois acceptes par minute, tous joueurs confondus
+# NB : derriere le tunnel bore (Render), tous les Android arrivent avec l'IP 127.0.0.1 : la limite par IP
+# s'y regle a 0 (desactivee) avec --classement-ip-scores 0 --classement-ip-lectures 0 (voir render/start.sh).
+CJ_JOURS_DEFAUT = 30
+_CJ_GROS_MOTS = ('pute', 'salope', 'connard', 'conard', 'encule', 'nique', 'ntm', 'fdp', 'batard',
+                 'merde', 'bite', 'couille', 'chatte', 'negre', 'negro', 'nazi', 'hitler', 'fuck',
+                 'shit', 'bitch', 'cunt', 'dick', 'nigg', 'fagg', 'porn', 'sexe', 'whore', 'slut',
+                 'pussy', 'asshole', 'retard', 'pedo')
+
+
+def cj_score(vies, images):
+    return vies * 1000 + max(0, CJ_BONUS_MAX - images // CJ_PAS_BONUS)
+
+
+def _cj_int(v):
+    """Entier strict (un float rond est accepte : certains JSON l'ecrivent 3.0)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e9:
+        return int(v)
+    return None
+
+
+def cj_valeurs_ok(vies, vm, images):
+    return (vies is not None and vm is not None and images is not None
+            and 1 <= vm <= CJ_VIES_MAX and 1 <= vies <= vm
+            and CJ_IMAGES_MIN_PAR_VIE * vm <= images <= CJ_IMAGES_MAX)
+
+
+def _cj_plat(txt):
+    import unicodedata
+    t = unicodedata.normalize('NFKD', txt.lower())
+    t = ''.join(c for c in t if not unicodedata.combining(c))
+    t = t.replace('0', 'o').replace('1', 'i').replace('3', 'e').replace('4', 'a').replace('5', 's').replace('@', 'a')
+    return ''.join(c for c in t if c.isalnum())
+
+
+def cj_pseudo_defaut(pid):
+    return 'Combattant%04d' % (int(pid[-6:], 16) % 10000)
+
+
+def cj_pseudo(v, pid):
+    """Pseudo propre : 16 caracteres au plus, lettres (latin), chiffres, espace _ - . ; sinon un nom
+    par defaut tire de l'identifiant anonyme. Les gros mots (FR/EN) donnent aussi le nom par defaut."""
+    if not isinstance(v, str):
+        return cj_pseudo_defaut(pid)
+    out = []
+    for ch in v:
+        if ch.isalnum() and ord(ch) < 0x250 or ch in ' _-.':
+            out.append(ch)
+    p = ' '.join(''.join(out).split())[:CJ_PSEUDO_MAX].strip()
+    if len(p) < 2:
+        return cj_pseudo_defaut(pid)
+    plat = _cj_plat(p)
+    if any(m in plat for m in _CJ_GROS_MOTS):
+        return cj_pseudo_defaut(pid)
+    return p
+
+
+def cj_date_ok(d, maintenant=None):
+    """La date du telephone : AAAA-MM-JJ, a +-1 jour de la date UTC du relais (fuseaux -12 a +14)."""
+    import datetime
+    if not isinstance(d, str) or len(d) != 10:
+        return False
+    try:
+        jour = datetime.date.fromisoformat(d)
+    except ValueError:
+        return False
+    utc = datetime.datetime.fromtimestamp(time.time() if maintenant is None else maintenant,
+                                          datetime.timezone.utc).date()
+    return abs((jour - utc).days) <= 1
+
+
+class ClassementJour(object):
+    """Un tableau par date : pid -> [pseudo, score, vies, images, instant, version]. Fichier
+    <dossier>/jour-AAAA-MM-JJ.json si --classement-dir est donne (sinon en memoire)."""
+
+    def __init__(self, dossier=None, jours=CJ_JOURS_DEFAUT, ip_scores=CJ_IP_SCORES_10MIN,
+                 ip_lectures=CJ_IP_LECTURES_10MIN):
+        self.dossier = dossier or None
+        self.jours = max(1, int(jours))
+        self.ip_scores_max = max(0, int(ip_scores))        # 0 = pas de limite par IP
+        self.ip_lectures_max = max(0, int(ip_lectures))
+        self.minute = []                                     # instants des derniers envois acceptes
+        self.tables = {}           # date -> {pid: [...]}
+        self.tri = {}              # date -> liste triee (cache)
+        self.sales = set()         # dates a ecrire
+        self.ip_scores = {}        # ip -> [instants] (memoire seulement)
+        self.ip_lectures = {}
+        self.pid_envois = {}       # (date, pid) -> nombre
+        self.stats = dict(envois=0, refus=0, lectures=0)
+        if self.dossier:
+            try:
+                os.makedirs(self.dossier, exist_ok=True)
+            except OSError as e:
+                log.warning('classement : dossier %s impossible (%s) - en memoire', self.dossier, e)
+                self.dossier = None
+        self.purger()
+
+    # ---- fichiers ----
+    def _chemin(self, d):
+        return os.path.join(self.dossier, 'jour-%s.json' % d)
+
+    def table(self, d):
+        t = self.tables.get(d)
+        if t is None:
+            t = {}
+            if self.dossier and os.path.exists(self._chemin(d)):
+                try:
+                    with open(self._chemin(d), encoding='utf-8') as f:
+                        brut = json.load(f)
+                    if isinstance(brut, dict):
+                        t = {k: v for k, v in brut.items() if pid_valide(k) and isinstance(v, list) and len(v) >= 6}
+                except Exception as e:
+                    log.warning('classement %s illisible (%s) : on repart de zero', d, e)
+            self.tables[d] = t
+        return t
+
+    def sauver(self):
+        if not self.dossier:
+            self.sales.clear()
+            return
+        for d in list(self.sales):
+            t = self.tables.get(d)
+            if t is None:
+                continue
+            tmp = self._chemin(d) + '.tmp'
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(t, f, ensure_ascii=False, separators=(',', ':'))
+                os.replace(tmp, self._chemin(d))
+            except OSError as e:
+                log.warning('classement %s non ecrit (%s)', d, e)
+        self.sales.clear()
+
+    def purger(self, maintenant=None):
+        """Oublie les dates de plus de self.jours jours (memoire et fichiers) et les compteurs de debit."""
+        import datetime
+        now = time.time() if maintenant is None else maintenant
+        limite = (datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+                  - datetime.timedelta(days=self.jours)).isoformat()
+        for d in [d for d in self.tables if d < limite]:
+            self.tables.pop(d, None)
+            self.tri.pop(d, None)
+        # en memoire on ne garde que les dates encore jouables (+-1 jour) ; les autres restent sur disque
+        for d in [d for d in self.tables if not cj_date_ok(d, now) and d not in self.sales]:
+            self.tables.pop(d, None)
+            self.tri.pop(d, None)
+        if self.dossier:
+            try:
+                for nomf in os.listdir(self.dossier):
+                    if nomf.startswith('jour-') and nomf.endswith('.json') and nomf[5:15] < limite:
+                        os.remove(os.path.join(self.dossier, nomf))
+            except OSError:
+                pass
+        self.pid_envois = {k: v for k, v in self.pid_envois.items() if cj_date_ok(k[0], now)}
+        mono = time.monotonic()
+        for dico in (self.ip_scores, self.ip_lectures):
+            for ip in list(dico):
+                dico[ip] = [x for x in dico[ip] if mono - x < 600]
+                if not dico[ip]:
+                    del dico[ip]
+
+    # ---- classement ----
+    def classes(self, d):
+        l = self.tri.get(d)
+        if l is None:
+            t = self.table(d)
+            l = sorted(t.items(), key=lambda kv: (-kv[1][1], kv[1][3], kv[1][4], kv[0]))
+            self.tri[d] = l
+        return l
+
+    def rang(self, d, pid):
+        for i, (p, _v) in enumerate(self.classes(d)):
+            if p == pid:
+                return i + 1
+        return 0
+
+    def _debit(self, dico, ip, maxi):
+        if maxi <= 0:
+            return True
+        mono = time.monotonic()
+        l = [x for x in dico.get(ip, []) if mono - x < 600]
+        if len(l) >= maxi:
+            dico[ip] = l
+            return False
+        l.append(mono)
+        dico[ip] = l
+        return True
+
+    def traiter(self, cl, o):
+        t = o.get('t')
+        if t == 'jscore':
+            return self.envoi(cl, o)
+        if t == 'jtop':
+            return self.lecture(cl, o)
+        return None
+
+    def _refus(self, cl, why):
+        self.stats['refus'] += 1
+        cl.send({'t': 'jscore_ko', 'why': why})
+        return None
+
+    def envoi(self, cl, o):
+        if cl.jscore_fait:
+            return self._refus(cl, 'un_seul')            # un envoi par connexion (le defi sert une fois)
+        if not self._debit(self.ip_scores, cl.ip, self.ip_scores_max):
+            return self._refus(cl, 'debit')
+        mono = time.monotonic()
+        self.minute = [x for x in self.minute if mono - x < 60]
+        if len(self.minute) >= CJ_ENVOIS_MINUTE:
+            return self._refus(cl, 'debit')
+        d = o.get('d')
+        if not cj_date_ok(d):
+            return self._refus(cl, 'date')
+        vies, vm, images, s = _cj_int(o.get('v')), _cj_int(o.get('vm')), _cj_int(o.get('f')), _cj_int(o.get('s'))
+        if not cj_valeurs_ok(vies, vm, images):
+            return self._refus(cl, 'valeurs')
+        score = cj_score(vies, images)
+        if s != score or score > CJ_SCORE_MAX:
+            return self._refus(cl, 'score')
+        n = o.get('n') if isinstance(o.get('n'), str) else ''
+        ver = str(o.get('ver', ''))[:16]
+        try:
+            pk = _b64d(o.get('pk', ''))
+            pid = hashlib.sha256(pk).hexdigest()[:ID_LEN]
+            if pid != o.get('pid') or len(pk) != 32:
+                return self._refus(cl, 'sig')
+            msg = 'jour|%s|%s|%d|%d|%d|%s|%s' % (cl.defi, d, vies, vm, images, n[:64], ver)
+            if not ed25519_verify(msg.encode('utf-8'), _b64d(o.get('sig', '')), pk):
+                return self._refus(cl, 'sig')
+        except (TypeError, ValueError, binascii.Error):
+            return self._refus(cl, 'sig')
+        cl.jscore_fait = True
+        self.minute.append(time.monotonic())
+        cle = (d, pid)
+        if self.pid_envois.get(cle, 0) >= CJ_PID_SCORES_JOUR:
+            return self._refus(cl, 'debit')
+        self.pid_envois[cle] = self.pid_envois.get(cle, 0) + 1
+        nom = cj_pseudo(n, pid)
+        t = self.table(d)
+        ex = t.get(pid)
+        if ex is None and len(t) >= CJ_LIGNES_MAX:
+            return self._refus(cl, 'plein')
+        mieux = ex is None or score > ex[1] or (score == ex[1] and images < ex[3])
+        if mieux:
+            t[pid] = [nom, score, vies, images, int(time.time()), ver]
+        elif ex[0] != nom:
+            ex[0] = nom                                    # le pseudo change, le score reste le meilleur
+        self.tri.pop(d, None)
+        self.sales.add(d)
+        self.stats['envois'] += 1
+        e = t[pid]
+        cl.send({'t': 'jscore_ok', 'd': d, 's': e[1], 'n': e[0], 'rang': self.rang(d, pid),
+                 'total': len(t), 'mieux': 1 if mieux else 0})
+        log.info('%s classement du jour %s : %d (%s) rang %d/%d', cl.tag(), d, e[1],
+                 'record' if mieux else 'pas mieux', self.rang(d, pid), len(t))
+        return None
+
+    def lecture(self, cl, o):
+        if not self._debit(self.ip_lectures, cl.ip, self.ip_lectures_max):
+            cl.send({'t': 'jtop_ko', 'why': 'debit'})
+            return None
+        d = o.get('d')
+        if not cj_date_ok(d):
+            cl.send({'t': 'jtop_ko', 'why': 'date'})
+            return None
+        self.stats['lectures'] += 1
+        l = self.classes(d)
+        top = [[v[0], v[1], v[2], v[3]] for _p, v in l[:CJ_TOP]]
+        moi = None
+        pid = o.get('pid')
+        if pid_valide(pid):
+            r = self.rang(d, pid)
+            if r:
+                v = self.table(d)[pid]
+                moi = {'rang': r, 's': v[1], 'n': v[0], 'v': v[2], 'f': v[3]}
+        cl.send({'t': 'jtop_ok', 'd': d, 'total': len(l), 'top': top, 'moi': moi})
+        return None
+
+
 class Relais(object):
     def __init__(self, args):
         self.a = args
@@ -643,6 +974,10 @@ class Relais(object):
         self.paires = {}           # pid -> (pid de l'adversaire, instant) : partie en cours
         self.ws_attente = {}       # WebSocket pas encore ouverts -> instant
         self.courrier = Courrier(args.mail_file)
+        self.classement = ClassementJour(getattr(args, 'classement_dir', None),
+                                         getattr(args, 'classement_jours', CJ_JOURS_DEFAUT),
+                                         getattr(args, 'classement_ip_scores', CJ_IP_SCORES_10MIN),
+                                         getattr(args, 'classement_ip_lectures', CJ_IP_LECTURES_10MIN))
         self.cid = 0
         self.depuis = time.time()
         self.stats = dict(connexions=0, identifies=0, refus_auth=0, pleins=0, messages=0,
@@ -679,7 +1014,7 @@ class Relais(object):
         if ws:
             self.stats['ws'] += 1
         log.debug('%s connexion', cl.tag())
-        cl.send({'t': 'hello', 'pv': PROTO, 'challenge': cl.defi})
+        cl.send({'t': 'hello', 'pv': PROTO, 'challenge': cl.defi, 'features': ['jour']})
         return cl
 
     def ligne(self, cl, ligne):
@@ -802,6 +1137,10 @@ class Relais(object):
             if cl.pid is not None:
                 return None
             return self.auth(cl, o)
+
+        # 7o : classement du Combat du jour (avant ou apres l'identification, voir ClassementJour)
+        if t == 'jscore' or t == 'jtop':
+            return self.classement.traiter(cl, o)
 
         if cl.pid is None:
             return None                     # rien avant l'identification
@@ -988,6 +1327,9 @@ class Relais(object):
             n += 1
             self.courrier.purger()
             self.courrier.sauver()
+            self.classement.sauver()
+            if n % 60 == 0:
+                self.classement.purger()
             now = time.time()
             for c in [c for c, e in self.salons.items() if now - e[3] > SALON_TTL]:
                 del self.salons[c]
@@ -1085,6 +1427,7 @@ async def principal(args):
             cl.close()
         r.courrier.purger()
         r.courrier.sauver(force=bool(args.mail_file))
+        r.classement.sauver()
         r.journal_stats()
         await asyncio.sleep(0.05)
 
@@ -1119,6 +1462,15 @@ def main(argv=None):
                     help='secondes pour s identifier apres la connexion (defaut 20)')
     ap.add_argument('--mail-file', default='',
                     help='fichier JSON ou garder les messages des absents (sinon : memoire)')
+    ap.add_argument('--classement-dir', default='',
+                    help='7o : dossier des classements du Combat du jour (un JSON par date ; sinon : memoire)')
+    ap.add_argument('--classement-jours', type=int, default=CJ_JOURS_DEFAUT,
+                    help='7o : jours de conservation des classements (defaut 30)')
+    ap.add_argument('--classement-ip-scores', type=int, default=CJ_IP_SCORES_10MIN,
+                    help='7o : envois de score par IP en 10 min (defaut 20 ; 0 = pas de limite, '
+                         'a mettre derriere un tunnel ou toutes les connexions ont la meme IP)')
+    ap.add_argument('--classement-ip-lectures', type=int, default=CJ_IP_LECTURES_10MIN,
+                    help='7o : lectures du classement par IP en 10 min (defaut 60 ; 0 = pas de limite)')
     ap.add_argument('--stats-every', type=int, default=300,
                     help='secondes entre deux lignes d etat dans le journal (defaut 300)')
     ap.add_argument('--no-uvloop', action='store_true',
@@ -1132,6 +1484,7 @@ def main(argv=None):
     a.heartbeat = max(0.5, a.heartbeat)
     a.hello_timeout = max(1.0, a.hello_timeout)
     a.mail_file = a.mail_file or None
+    a.classement_dir = a.classement_dir or None
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG if a.verbose else logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
